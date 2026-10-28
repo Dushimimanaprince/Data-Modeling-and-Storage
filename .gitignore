@@ -1,0 +1,17 @@
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# Database dumps / logs
+*.backup
+*.dump
+*.log
+
+# Secrets
+.env
