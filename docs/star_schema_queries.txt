@@ -1,0 +1,212 @@
+======================================================================
+HEALTHCARE ANALYTICS LAB - PART 3.3: QUERIES ON THE STAR SCHEMA
+======================================================================
+
+Environment and method
+----------------------
+- Same database, data volume and machine as Part 2 (query_analysis.txt).
+- Star schema loaded by sql/etl/01-03 and validated by sql/etl/04
+  (all 14 source-to-target checks PASS).
+- Each query returns the same results as its OLTP version.
+- Measurement: EXPLAIN (ANALYZE, BUFFERS), 3 runs, median Execution Time.
+- Improvement factor = OLTP time / star time.
+
+Reference figures in brackets "(dev test: ...)" come from a test run on a
+separate PostgreSQL instance with identical data. They show the expected
+order of magnitude; the measured values are the ones that count.
+
+
+----------------------------------------------------------------------
+QUESTION 1: Monthly Encounters by Specialty
+----------------------------------------------------------------------
+
+SQL (star schema):
+    WITH patient_level AS (
+        SELECT d.month_start_date, f.specialty_key, f.encounter_type_key,
+               f.patient_key, SUM(f.encounter_count) AS encounters
+        FROM star.fact_encounters f
+        JOIN star.dim_date d ON d.date_key = f.encounter_date_key
+        GROUP BY d.month_start_date, f.specialty_key,
+                 f.encounter_type_key, f.patient_key
+    ),
+    monthly AS (
+        SELECT month_start_date, specialty_key, encounter_type_key,
+               SUM(encounters) AS total_encounters,
+               COUNT(*)        AS unique_patients
+        FROM patient_level
+        GROUP BY month_start_date, specialty_key, encounter_type_key
+    )
+    SELECT TO_CHAR(m.month_start_date, 'YYYY-MM') AS year_month,
+           s.specialty_name, t.encounter_type_name,
+           m.total_encounters, m.unique_patients
+    FROM monthly m
+    JOIN star.dim_specialty      s ON s.specialty_key      = m.specialty_key
+    JOIN star.dim_encounter_type t ON t.encounter_type_key = m.encounter_type_key
+    ORDER BY year_month, s.specialty_name, t.encounter_type_name;
+
+Execution time: ~[S1_TIME_MS] ms vs [Q1_TIME_MS] ms original
+                (dev test: ~730 ms vs ~1,150 ms)
+Improvement factor: [Q1_TIME_MS / S1_TIME_MS]x   (dev test: ~1.6x)
+
+Why it is faster:
+- No provider hop: specialty_key is stored on the fact, so the
+  encounters -> providers -> specialties chain disappears.
+- No per-row date function: the month comes from dim_date.month_start_date
+  instead of DATE_TRUNC on 500K timestamps.
+- Grouping on small integer keys first; names are attached only to the
+  ~456 result rows at the end.
+- COUNT(DISTINCT) rewritten as two-level aggregation (group to
+  patient level, then count rows), which PostgreSQL can hash instead of
+  sorting every row with text keys.
+
+Why the gain is the smallest of the four:
+- "Unique patients" is a non-additive measure. It cannot be pre-computed
+  on the encounter-grain fact, so the query must still examine every
+  encounter/patient combination.
+- A first, straightforward version (fact joined to all dimensions with
+  COUNT(DISTINCT patient_key) and GROUP BY on text labels) was actually
+  slower than OLTP (dev test ~1.5 s), because the fact table is wider than
+  encounters and the distinct sort still spilled to disk. The query shape
+  matters as much as the schema.
+- If this report were run constantly, an aggregate fact table at
+  month x specialty x encounter type grain would make it near-instant.
+
+
+----------------------------------------------------------------------
+QUESTION 2: Top Diagnosis-Procedure Pairs
+----------------------------------------------------------------------
+
+SQL (star schema):
+    WITH pair_counts AS (
+        SELECT bd.diagnosis_key, bp.procedure_key, COUNT(*) AS encounter_count
+        FROM star.bridge_encounter_diagnoses  bd
+        JOIN star.bridge_encounter_procedures bp
+          ON bp.encounter_key = bd.encounter_key
+        GROUP BY bd.diagnosis_key, bp.procedure_key
+    )
+    SELECT dg.icd10_code, dg.icd10_description,
+           pr.cpt_code, pr.cpt_description, pc.encounter_count
+    FROM pair_counts pc
+    JOIN star.dim_diagnosis dg ON dg.diagnosis_key = pc.diagnosis_key
+    JOIN star.dim_procedure pr ON pr.procedure_key = pc.procedure_key
+    ORDER BY pc.encounter_count DESC
+    LIMIT 20;
+
+Execution time: ~[S2_TIME_MS] ms vs [Q2_TIME_MS] ms original
+                (dev test: ~770 ms vs ~4,800 ms)
+Improvement factor: [Q2_TIME_MS / S2_TIME_MS]x   (dev test: ~6x)
+
+Why it is faster:
+- COUNT(DISTINCT) removed: the bridge primary keys
+  (encounter_key, diagnosis_key) and (encounter_key, procedure_key)
+  guarantee each pair appears once per encounter, so COUNT(*) already
+  counts distinct encounters. The huge distinct sort that spilled to disk
+  is gone; a hash aggregate over integer keys is used instead.
+- Aggregate first, describe later: the 1.87M exploded rows are grouped on
+  two integers into 414 pairs, and only then joined to the 23-row and
+  18-row dimensions for codes and descriptions.
+- Narrow tables: bridge rows contain only small integer keys, so less data
+  is read and hashed than with the OLTP junction tables.
+
+What did not change:
+- The per-encounter row explosion (N diagnoses x M procedures) still
+  happens; it is inherent to the question. The bridges make it cheaper,
+  not smaller. A pre-computed pair aggregate table would remove it.
+
+
+----------------------------------------------------------------------
+QUESTION 3: 30-Day Readmission Rate by Specialty
+----------------------------------------------------------------------
+
+SQL (star schema):
+    SELECT s.specialty_name,
+           COUNT(*)                  AS inpatient_discharges,
+           SUM(f.is_readmission_30d) AS readmissions_30d,
+           ROUND(100.0 * SUM(f.is_readmission_30d) / COUNT(*), 2)
+                                     AS readmission_rate_pct
+    FROM star.fact_encounters    f
+    JOIN star.dim_encounter_type t ON t.encounter_type_key = f.encounter_type_key
+    JOIN star.dim_specialty      s ON s.specialty_key      = f.specialty_key
+    WHERE t.is_inpatient
+    GROUP BY s.specialty_name
+    ORDER BY readmission_rate_pct DESC;
+
+Execution time: ~[S3_TIME_MS] ms vs [Q3_TIME_MS] ms original
+                (dev test: ~100 ms vs ~420 ms)
+Improvement factor: [Q3_TIME_MS / S3_TIME_MS]x   (dev test: ~4x)
+
+Why it is faster:
+- The self-join is gone. The readmission relationship was computed once
+  in the ETL (02_load_fact_encounters.sql) and stored as the 0/1 flag
+  is_readmission_30d, so the rate is a simple SUM / COUNT.
+- Encounters is read once instead of twice, and the ~1.13M same-patient
+  candidate pairs are never built.
+- No COUNT(DISTINCT): each fact row is one encounter, so COUNT(*) is the
+  number of discharges.
+- The inpatient filter uses the encounter type dimension and the
+  composite index (encounter_type_key, specialty_key).
+- Results are identical to the OLTP query (e.g. Pediatrics 33.37%,
+  36,825 readmissions in total), which validates the ETL logic.
+
+
+----------------------------------------------------------------------
+QUESTION 4: Revenue by Specialty and Month
+----------------------------------------------------------------------
+
+SQL (star schema):
+    WITH monthly AS (
+        SELECT d.month_start_date, f.specialty_key,
+               COUNT(*) FILTER (WHERE f.claim_count > 0) AS billed_encounters,
+               SUM(f.total_claim_amount)   AS total_claim_amount,
+               SUM(f.total_allowed_amount) AS total_allowed_amount
+        FROM star.fact_encounters f
+        JOIN star.dim_date d ON d.date_key = f.encounter_date_key
+        GROUP BY d.month_start_date, f.specialty_key
+    )
+    SELECT TO_CHAR(m.month_start_date, 'YYYY-MM') AS year_month,
+           s.specialty_name, m.billed_encounters,
+           m.total_claim_amount, m.total_allowed_amount
+    FROM monthly m
+    JOIN star.dim_specialty s ON s.specialty_key = m.specialty_key
+    WHERE m.billed_encounters > 0
+    ORDER BY year_month, m.total_allowed_amount DESC;
+
+Execution time: ~[S4_TIME_MS] ms vs [Q4_TIME_MS] ms original
+                (dev test: ~150 ms vs ~1,050 ms)
+Improvement factor: [Q4_TIME_MS / S4_TIME_MS]x   (dev test: ~7x)
+
+Why it is faster:
+- Billing is not touched: claim and allowed totals were pre-aggregated
+  per encounter during ETL and stored on the fact row.
+- The 3-hop chain billing -> encounters -> providers -> specialties
+  becomes fact -> dim_date and fact -> dim_specialty, both one hop to
+  small tables.
+- No COUNT(DISTINCT): billed encounters is a filtered COUNT(*), because
+  the fact grain is one row per encounter.
+- Grouping on (date, integer key) produces only 240 groups, handled by a
+  small in-memory hash aggregate instead of a large sort spilling to disk.
+
+
+----------------------------------------------------------------------
+SUMMARY
+----------------------------------------------------------------------
+
+| Query | OLTP joins | Star joins | OLTP time   | Star time   | Factor  | Main reason                         |
+|-------|------------|------------|-------------|-------------|---------|-------------------------------------|
+| Q1    | 2          | 3 (small)  | [Q1] ms     | [S1] ms     | [x]     | Integer grouping, date dim          |
+| Q2    | 3          | 3          | [Q2] ms     | [S2] ms     | [x]     | No DISTINCT, aggregate on int keys  |
+| Q3    | 3 (1 self) | 2          | [Q3] ms     | [S3] ms     | [x]     | Precomputed readmission flag        |
+| Q4    | 3          | 2          | [Q4] ms     | [S4] ms     | [x]     | Pre-aggregated billing on the fact  |
+
+(dev test factors: Q1 ~1.6x, Q2 ~6x, Q3 ~4x, Q4 ~7x)
+
+Note on join counts: the star queries do not always use fewer joins
+(Q1 uses three). The difference is what is joined: every star join goes
+from the fact straight to a small dimension (10-4,000 rows) on an integer
+key, often after aggregation, whereas the OLTP joins chain large tables
+together before aggregation.
+
+Overall: the biggest gains come from work moved into the ETL
+(pre-aggregated billing, the readmission flag) and from removing
+COUNT(DISTINCT) through a well-defined grain. Queries whose answer is
+inherently non-additive (unique patients) improve the least.
