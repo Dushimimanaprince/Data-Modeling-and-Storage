@@ -1,0 +1,265 @@
+======================================================================
+HEALTHCARE ANALYTICS LAB - PART 2: OLTP QUERY PERFORMANCE ANALYSIS
+======================================================================
+
+Environment
+-----------
+- Database: PostgreSQL 18 (pgAdmin 4), database "healthcare_analytics", schema "oltp"
+- Data volume (lab sample data + synthetic data, setseed 0.42):
+    patients               50,003
+    providers                 203
+    specialties                10
+    departments                10
+    diagnoses                  23
+    procedures                 18
+    encounters            500,004
+    encounter_diagnoses 1,249,110
+    encounter_procedures  749,536
+    billing               424,535
+- Indexes: only those in the original lab DDL (primary keys, mrn UNIQUE,
+  encounters.encounter_date, billing.claim_date). Foreign key columns are
+  NOT indexed (PostgreSQL does not index foreign keys automatically).
+- Measurement method: EXPLAIN (ANALYZE, BUFFERS), run 3 times after ANALYZE;
+  the median "Execution Time" is reported.
+
+
+----------------------------------------------------------------------
+QUESTION 1: Monthly Encounters by Specialty
+----------------------------------------------------------------------
+
+SQL Query:
+    SELECT
+        DATE_TRUNC('month', e.encounter_date)::date AS encounter_month,
+        s.specialty_name,
+        e.encounter_type,
+        COUNT(*)                     AS total_encounters,
+        COUNT(DISTINCT e.patient_id) AS unique_patients
+    FROM oltp.encounters e
+    JOIN oltp.providers   p ON p.provider_id  = e.provider_id
+    JOIN oltp.specialties s ON s.specialty_id = p.specialty_id
+    GROUP BY
+        DATE_TRUNC('month', e.encounter_date)::date,
+        s.specialty_name,
+        e.encounter_type
+    ORDER BY encounter_month, s.specialty_name, e.encounter_type;
+
+Schema Analysis:
+- Tables joined: encounters, providers, specialties
+- Number of joins: 2
+- Join chain: encounters -> providers -> specialties
+  (specialty is not stored on the encounter; providers is used only as a
+  stepping stone to reach it)
+
+Performance:
+- Execution time: [Q1_TIME_MS] ms
+- Estimated rows scanned: ~500,217
+  (encounters 500,004 + providers 203 + specialties 10)
+- Rows flowing into GROUP BY: 500,004
+- Rows returned: ~456
+- Sort spilled to disk (external merge): [YES/NO, SIZE]
+
+Bottleneck Identified:
+1. Full sequential scan of all 500,004 encounters. The query needs every
+   row, so no index can reduce the work.
+2. JOIN chain: every encounter row must be matched to its provider and
+   then to its specialty before it can be grouped. The specialty name is
+   two hops away from the event because of 3NF normalization.
+3. GROUP BY on a computed expression: DATE_TRUNC('month', encounter_date)
+   is recalculated for every row on every run; there is no stored "month"
+   attribute to group by.
+4. COUNT(DISTINCT patient_id) forces PostgreSQL to sort all 500K joined
+   rows by (month, specialty, type, patient_id). This sort is the most
+   expensive step and is too large for work_mem (4 MB default), so it
+   spills to temporary files on disk (external merge).
+Root cause: the analytical attributes (month, specialty) are not stored
+with the event, so they must be derived and joined at query time, then
+sorted in full.
+
+
+----------------------------------------------------------------------
+QUESTION 2: Top Diagnosis-Procedure Pairs
+----------------------------------------------------------------------
+
+SQL Query:
+    SELECT
+        d.icd10_code,
+        d.icd10_description,
+        pr.cpt_code,
+        pr.cpt_description,
+        COUNT(DISTINCT ed.encounter_id) AS encounter_count
+    FROM oltp.encounter_diagnoses  ed
+    JOIN oltp.encounter_procedures ep ON ep.encounter_id = ed.encounter_id
+    JOIN oltp.diagnoses            d  ON d.diagnosis_id  = ed.diagnosis_id
+    JOIN oltp.procedures           pr ON pr.procedure_id = ep.procedure_id
+    GROUP BY d.icd10_code, d.icd10_description, pr.cpt_code, pr.cpt_description
+    ORDER BY encounter_count DESC
+    LIMIT 20;
+
+Schema Analysis:
+- Tables joined: encounter_diagnoses, encounter_procedures, diagnoses,
+  procedures
+- Number of joins: 3
+- How diagnosis and procedure data are combined: the two junction tables
+  have no direct relationship. The only link is encounter_id, so
+  encounter_diagnoses is joined to encounter_procedures ON encounter_id.
+  Every diagnosis of an encounter is paired with every procedure of the
+  same encounter (a per-encounter Cartesian product).
+
+Performance:
+- Execution time: [Q2_TIME_MS] ms
+- Estimated rows scanned: ~1,998,687
+  (encounter_diagnoses 1,249,110 + encounter_procedures 749,536
+   + diagnoses 23 + procedures 18)
+- Rows produced by the junction-to-junction join: 1,873,703
+- Rows returned: 20 (414 distinct pairs before LIMIT)
+- Sort spilled to disk (external merge): [YES/NO, SIZE]
+
+Bottleneck Identified:
+1. Row explosion: an encounter with N diagnoses and M procedures produces
+   N x M rows. Example from the sample data: encounter 7001 has 2
+   diagnoses and 2 procedures, so it becomes 4 rows. Across the dataset,
+   2.0M input rows become 1.87M intermediate pairs.
+2. Both junction tables are the largest tables in the schema and must be
+   scanned in full; encounter_id is not indexed in either of them.
+3. COUNT(DISTINCT encounter_id) over 414 groups requires sorting all
+   1.87M exploded rows, which spills to disk.
+4. LIMIT 20 does not help: every pair must be counted before the top 20
+   can be chosen.
+Root cause: two independent many-to-many relationships are stored in
+separate junction tables, so combining them multiplies rows before any
+aggregation can happen.
+
+
+----------------------------------------------------------------------
+QUESTION 3: 30-Day Readmission Rate by Specialty
+----------------------------------------------------------------------
+
+SQL Query:
+    SELECT
+        s.specialty_name,
+        COUNT(DISTINCT i.encounter_id) AS inpatient_discharges,
+        COUNT(DISTINCT CASE WHEN r.encounter_id IS NOT NULL
+                            THEN i.encounter_id END) AS readmissions_30d,
+        ROUND(100.0 * COUNT(DISTINCT CASE WHEN r.encounter_id IS NOT NULL
+                                          THEN i.encounter_id END)
+                    / COUNT(DISTINCT i.encounter_id), 2) AS readmission_rate_pct
+    FROM oltp.encounters i
+    JOIN oltp.providers   p ON p.provider_id  = i.provider_id
+    JOIN oltp.specialties s ON s.specialty_id = p.specialty_id
+    LEFT JOIN oltp.encounters r
+           ON r.patient_id     =  i.patient_id
+          AND r.encounter_id   <> i.encounter_id
+          AND r.encounter_date >  i.discharge_date
+          AND r.encounter_date <= i.discharge_date + INTERVAL '30 days'
+    WHERE i.encounter_type = 'Inpatient'
+    GROUP BY s.specialty_name
+    ORDER BY readmission_rate_pct DESC;
+
+Schema Analysis:
+- Tables joined: encounters (as i = index stay), providers, specialties,
+  encounters (as r = return visit)
+- Number of joins: 3 (including 1 self-join on encounters)
+- Readmission detection: for each inpatient encounter (i), look for
+  another encounter (r) of the same patient whose encounter_date is after
+  i.discharge_date and no later than i.discharge_date + 30 days. If at
+  least one exists, the inpatient stay counts as readmitted. The
+  readmission is attributed to the specialty of the original inpatient
+  stay. A LEFT JOIN keeps stays with no return visit (denominator).
+
+Performance:
+- Execution time: [Q3_TIME_MS] ms
+- Estimated rows scanned: ~1,000,221
+  (encounters scanned twice: 500,004 x 2, + providers 203 + specialties 10)
+- Inpatient stays evaluated: 112,681
+- Candidate pairs checked by the self-join (same patient): ~1,126,994
+- Rows returned: 9 (Emergency has no inpatient stays)
+- Sort spilled to disk (external merge): [YES/NO, SIZE]
+
+Bottleneck Identified:
+1. Self-join: the largest event table is read twice and joined to itself.
+2. The join key patient_id is not indexed, so PostgreSQL hashes the full
+   encounters table to find each patient's other visits.
+3. Only the equality part (patient_id) can drive the join; the date
+   range conditions are applied afterwards as a filter. About 1.13M
+   same-patient pairs are built and most are discarded
+   ("Rows Removed by Join Filter").
+4. One inpatient stay can match several return visits, so
+   COUNT(DISTINCT encounter_id) is needed to avoid double counting,
+   adding another sort.
+Root cause: "readmission" is a relationship between two events that is
+not stored anywhere; it must be rediscovered with a range self-join every
+time the question is asked.
+
+
+----------------------------------------------------------------------
+QUESTION 4: Revenue by Specialty and Month
+----------------------------------------------------------------------
+
+SQL Query:
+    SELECT
+        DATE_TRUNC('month', e.encounter_date)::date AS encounter_month,
+        s.specialty_name,
+        COUNT(DISTINCT b.encounter_id) AS billed_encounters,
+        SUM(b.claim_amount)            AS total_claim_amount,
+        SUM(b.allowed_amount)          AS total_allowed_amount
+    FROM oltp.billing     b
+    JOIN oltp.encounters  e ON e.encounter_id = b.encounter_id
+    JOIN oltp.providers   p ON p.provider_id  = e.provider_id
+    JOIN oltp.specialties s ON s.specialty_id = p.specialty_id
+    GROUP BY DATE_TRUNC('month', e.encounter_date)::date, s.specialty_name
+    ORDER BY encounter_month, total_allowed_amount DESC;
+
+Schema Analysis:
+- Tables joined: billing, encounters, providers, specialties
+- Number of joins: 3
+- Join chain: billing -> encounters -> providers -> specialties
+- Revenue is measured by allowed_amount and dated by the encounter month.
+
+Performance:
+- Execution time: [Q4_TIME_MS] ms
+- Estimated rows scanned: ~924,752
+  (billing 424,535 + encounters 500,004 + providers 203 + specialties 10)
+- Rows flowing into GROUP BY: 424,535
+- Rows returned: ~240
+- Sort spilled to disk (external merge): [YES/NO, SIZE]
+
+Bottleneck Identified:
+1. Longest join chain of the four questions: the money (billing) is three
+   hops away from the grouping attribute (specialty).
+2. Two large tables (billing and encounters) must be fully scanned and
+   joined; billing.encounter_id is not indexed.
+3. The month is derived per row from encounters.encounter_date, so
+   billing cannot be grouped without first joining to encounters.
+4. COUNT(DISTINCT encounter_id) plus GROUP BY over 424K rows requires a
+   large sort that spills to disk.
+Root cause: in 3NF the measure (allowed_amount), the time attribute
+(encounter_date) and the category (specialty) live in different tables,
+so every revenue question rebuilds the same join chain.
+
+
+----------------------------------------------------------------------
+SUMMARY OF ROOT CAUSES
+----------------------------------------------------------------------
+
+| Query | Tables | Joins | Main bottleneck                              | Time      |
+|-------|--------|-------|----------------------------------------------|-----------|
+| Q1    | 3      | 2     | Join chain + computed GROUP BY + DISTINCT sort | [Q1] ms |
+| Q2    | 4      | 3     | Junction-to-junction row explosion           | [Q2] ms   |
+| Q3    | 4      | 3     | Range self-join on unindexed patient_id      | [Q3] ms   |
+| Q4    | 4      | 3     | 3-hop join chain from billing to specialty   | [Q4] ms   |
+
+Common causes:
+1. 3NF spreads one business fact across many tables, so every analytical
+   question re-joins them.
+2. Attributes used for grouping (month, specialty) are derived or joined
+   at query time instead of being stored with the event.
+3. Many-to-many data (diagnoses, procedures) multiplies rows when combined.
+4. Derived business facts (readmission) are recomputed with expensive
+   self-joins on every run.
+5. Foreign key columns are not indexed, and large sorts exceed work_mem
+   and spill to disk.
+
+These causes drive the star schema design in Part 3: pre-joined
+dimensions, a date dimension, an encounter-grain fact table with
+pre-aggregated measures and a readmission flag, and bridge tables for
+diagnoses and procedures.
