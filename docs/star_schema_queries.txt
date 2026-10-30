@@ -8,12 +8,12 @@ Environment and method
 - Star schema loaded by sql/etl/01-03 and validated by sql/etl/04
   (all 14 source-to-target checks PASS).
 - Each query returns the same results as its OLTP version.
-- Measurement: EXPLAIN (ANALYZE, BUFFERS), 3 runs, median Execution Time.
+- Measurement: sql/benchmark/run_benchmark.sql runs each query with
+  EXPLAIN ANALYZE, 1 warm-up run + 3 measured runs; the median
+  Execution Time is reported.
 - Improvement factor = OLTP time / star time.
-
-Reference figures in brackets "(dev test: ...)" come from a test run on a
-separate PostgreSQL instance with identical data. They show the expected
-order of magnitude; the measured values are the ones that count.
+- Figures in brackets "(dev test: ...)" come from an earlier test on a
+  separate PostgreSQL instance with identical data, kept for reference only.
 
 
 ----------------------------------------------------------------------
@@ -44,9 +44,9 @@ SQL (star schema):
     JOIN star.dim_encounter_type t ON t.encounter_type_key = m.encounter_type_key
     ORDER BY year_month, s.specialty_name, t.encounter_type_name;
 
-Execution time: ~[S1_TIME_MS] ms vs [Q1_TIME_MS] ms original
+Execution time: ~1,600.3 ms vs 4,272.7 ms original
                 (dev test: ~730 ms vs ~1,150 ms)
-Improvement factor: [Q1_TIME_MS / S1_TIME_MS]x   (dev test: ~1.6x)
+Improvement factor: 2.7x   (dev test: ~1.6x)
 
 Why it is faster:
 - No provider hop: specialty_key is stored on the fact, so the
@@ -66,8 +66,9 @@ Why the gain is the smallest of the four:
 - A first, straightforward version (fact joined to all dimensions with
   COUNT(DISTINCT patient_key) and GROUP BY on text labels) was actually
   slower than OLTP (dev test ~1.5 s), because the fact table is wider than
-  encounters and the distinct sort still spilled to disk. The query shape
-  matters as much as the schema.
+  encounters and the distinct sort remained. In the final measured version
+  the star query no longer spills to disk (OLTP Q1 spilled ~21 MB). The
+  query shape matters as much as the schema.
 - If this report were run constantly, an aggregate fact table at
   month x specialty x encounter type grain would make it near-instant.
 
@@ -92,9 +93,9 @@ SQL (star schema):
     ORDER BY pc.encounter_count DESC
     LIMIT 20;
 
-Execution time: ~[S2_TIME_MS] ms vs [Q2_TIME_MS] ms original
+Execution time: ~1,102.1 ms vs 12,687.2 ms original
                 (dev test: ~770 ms vs ~4,800 ms)
-Improvement factor: [Q2_TIME_MS / S2_TIME_MS]x   (dev test: ~6x)
+Improvement factor: 11.5x   (dev test: ~6x)
 
 Why it is faster:
 - COUNT(DISTINCT) removed: the bridge primary keys
@@ -131,9 +132,9 @@ SQL (star schema):
     GROUP BY s.specialty_name
     ORDER BY readmission_rate_pct DESC;
 
-Execution time: ~[S3_TIME_MS] ms vs [Q3_TIME_MS] ms original
+Execution time: ~140.8 ms vs 716.3 ms original
                 (dev test: ~100 ms vs ~420 ms)
-Improvement factor: [Q3_TIME_MS / S3_TIME_MS]x   (dev test: ~4x)
+Improvement factor: 5.1x   (dev test: ~4x)
 
 Why it is faster:
 - The self-join is gone. The readmission relationship was computed once
@@ -171,9 +172,9 @@ SQL (star schema):
     WHERE m.billed_encounters > 0
     ORDER BY year_month, m.total_allowed_amount DESC;
 
-Execution time: ~[S4_TIME_MS] ms vs [Q4_TIME_MS] ms original
+Execution time: ~219.1 ms vs 3,504.2 ms original
                 (dev test: ~150 ms vs ~1,050 ms)
-Improvement factor: [Q4_TIME_MS / S4_TIME_MS]x   (dev test: ~7x)
+Improvement factor: 16.0x   (dev test: ~7x)
 
 Why it is faster:
 - Billing is not touched: claim and allowed totals were pre-aggregated
@@ -193,10 +194,10 @@ SUMMARY
 
 | Query | OLTP joins | Star joins | OLTP time   | Star time   | Factor  | Main reason                         |
 |-------|------------|------------|-------------|-------------|---------|-------------------------------------|
-| Q1    | 2          | 3 (small)  | [Q1] ms     | [S1] ms     | [x]     | Integer grouping, date dim          |
-| Q2    | 3          | 3          | [Q2] ms     | [S2] ms     | [x]     | No DISTINCT, aggregate on int keys  |
-| Q3    | 3 (1 self) | 2          | [Q3] ms     | [S3] ms     | [x]     | Precomputed readmission flag        |
-| Q4    | 3          | 2          | [Q4] ms     | [S4] ms     | [x]     | Pre-aggregated billing on the fact  |
+| Q1    | 2          | 3 (small)  | 4,273 ms    | 1,600 ms    | 2.7x    | Integer grouping, date dim          |
+| Q2    | 3          | 3          | 12,687 ms   | 1,102 ms    | 11.5x   | No DISTINCT, aggregate on int keys  |
+| Q3    | 3 (1 self) | 2          | 716 ms      | 141 ms      | 5.1x    | Precomputed readmission flag        |
+| Q4    | 3          | 2          | 3,504 ms    | 219 ms      | 16.0x   | Pre-aggregated billing on the fact  |
 
 (dev test factors: Q1 ~1.6x, Q2 ~6x, Q3 ~4x, Q4 ~7x)
 

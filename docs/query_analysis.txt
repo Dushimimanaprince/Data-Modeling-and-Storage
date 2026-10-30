@@ -51,12 +51,12 @@ Schema Analysis:
   stepping stone to reach it)
 
 Performance:
-- Execution time: [Q1_TIME_MS] ms
+- Execution time: 4272.7 ms
 - Estimated rows scanned: ~500,217
   (encounters 500,004 + providers 203 + specialties 10)
 - Rows flowing into GROUP BY: 500,004
 - Rows returned: ~456
-- Sort spilled to disk (external merge): [YES/NO, SIZE]
+- Sort spilled to disk (external merge): YES, ~21 MB (external merge)
 
 Bottleneck Identified:
 1. Full sequential scan of all 500,004 encounters. The query needs every
@@ -106,13 +106,13 @@ Schema Analysis:
   same encounter (a per-encounter Cartesian product).
 
 Performance:
-- Execution time: [Q2_TIME_MS] ms
+- Execution time: 	12687.2 ms
 - Estimated rows scanned: ~1,998,687
   (encounter_diagnoses 1,249,110 + encounter_procedures 749,536
    + diagnoses 23 + procedures 18)
 - Rows produced by the junction-to-junction join: 1,873,703
 - Rows returned: 20 (414 distinct pairs before LIMIT)
-- Sort spilled to disk (external merge): [YES/NO, SIZE]
+- Sort spilled to disk (external merge): YES, ~102 MB (external merge)
 
 Bottleneck Identified:
 1. Row explosion: an encounter with N diagnoses and M procedures produces
@@ -167,13 +167,13 @@ Schema Analysis:
   stay. A LEFT JOIN keeps stays with no return visit (denominator).
 
 Performance:
-- Execution time: [Q3_TIME_MS] ms
+- Execution time: 716.3 ms
 - Estimated rows scanned: ~1,000,221
   (encounters scanned twice: 500,004 x 2, + providers 203 + specialties 10)
 - Inpatient stays evaluated: 112,681
 - Candidate pairs checked by the self-join (same patient): ~1,126,994
 - Rows returned: 9 (Emergency has no inpatient stays)
-- Sort spilled to disk (external merge): [YES/NO, SIZE]
+- Sort spilled to disk (external merge): NO (sorts fit in memory)
 
 Bottleneck Identified:
 1. Self-join: the largest event table is read twice and joined to itself.
@@ -216,12 +216,12 @@ Schema Analysis:
 - Revenue is measured by allowed_amount and dated by the encounter month.
 
 Performance:
-- Execution time: [Q4_TIME_MS] ms
+- Execution time: 3504.2 ms
 - Estimated rows scanned: ~924,752
   (billing 424,535 + encounters 500,004 + providers 203 + specialties 10)
 - Rows flowing into GROUP BY: 424,535
 - Rows returned: ~240
-- Sort spilled to disk (external merge): [YES/NO, SIZE]
+- Sort spilled to disk (external merge): YES, ~19 MB (external merge)
 
 Bottleneck Identified:
 1. Longest join chain of the four questions: the money (billing) is three
